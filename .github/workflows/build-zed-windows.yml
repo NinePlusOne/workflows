@@ -1,0 +1,217 @@
+name: Build Zed for Windows 11
+
+on:
+  workflow_dispatch: # Allows manual triggering
+    inputs:
+      build_type:
+        description: 'Build Type (debug or release)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - debug
+          - release
+      target_arch:
+        description: 'Target Architecture (x86_64 or aarch64)'
+        required: true
+        default: 'x86_64'
+        type: choice
+        options:
+          - x86_64
+          - aarch64
+
+env:
+  # Use the SDK version mentioned in the Zed docs or the latest available via VS installer
+  # The example component is Windows 11 SDK (10.0.26100.0)
+  WINDOWS_SDK_VERSION: '10.0.26100.0'
+  # Set the target triple for Rust compilation
+  # x86_64 corresponds to x86_64-pc-windows-msvc
+  # aarch64 corresponds to aarch64-pc-windows-msvc
+  RUST_TARGET: ${{ inputs.target_arch == 'aarch64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc' }}
+
+jobs:
+  build:
+    runs-on: windows-latest # GitHub-hosted Windows runner, typically Windows 11
+    # Note: aarch64 cross-compilation might work, but native aarch64 runner is not standard.
+    # For native aarch64 builds, you'd need a self-hosted runner on aarch64 hardware.
+    strategy:
+      matrix:
+        target_arch: [ ${{ inputs.target_arch }} ] # Use the input value
+
+    steps:
+    - name: Checkout Zed repository
+      uses: actions/checkout@v4
+      with:
+        repository: 'zed-industries/zed' # Explicitly specify the Zed repository to clone
+        ref: main # Or specify a branch/tag if needed, e.g., 'v0.150.0'
+        submodules: 'recursive' # Zed likely uses submodules, ensure they are fetched
+        path: zed # Clone into a 'zed' subdirectory within the runner's workspace
+
+    - name: Set up Rust
+      # Uses the official rust-toolchain action to install rustup and the toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: ${{ env.RUST_TARGET }} # Install the specific target
+        # No need to set default-toolchain: false here, stable is default
+
+    - name: Set up Visual Studio Build Tools and Windows SDK
+      shell: powershell
+      run: |
+        # Define the Visual Studio Build Tools installer URL and path
+        $vsInstallerUrl = "https://aka.ms/vs/17/release/vs_buildtools.exe" # Generic latest link
+        $installerPath = "${{ runner.temp }}\vs_BuildTools.exe"
+
+        Write-Output "Downloading Visual Studio Build Tools from: $vsInstallerUrl"
+        Invoke-WebRequest -Uri $vsInstallerUrl -OutFile $installerPath -Verbose
+
+        # Define the components required based on the Zed documentation for Build Tools
+        # Using the Windows 11 SDK component mentioned in the docs
+        $components = @(
+          "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", # C++ x64/x86 build tools
+          "Microsoft.VisualStudio.Component.Windows11SDK.${{ env.WINDOWS_SDK_VERSION }}", # Windows 11 SDK
+          "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", # Spectre-mitigated libs
+          "Microsoft.VisualStudio.Component.VC.CMake.Project", # CMake support
+          "Microsoft.VisualStudio.Workload.VCTools", # Core C++ tools workload
+          "Microsoft.VisualStudio.Component.CoreBuildTools", # Core build tools
+          "Microsoft.Component.MSBuild" # MSBuild
+          # Add other components if needed based on the JSON in the docs
+        )
+
+        $componentArgs = $components | ForEach-Object { "--add", $_ }
+        # Add common build tools if not implicitly included in VCTools
+        # $componentArgs += @("--add", "Microsoft.VisualStudio.Component.CoreBuildTools")
+        # $componentArgs += @("--add", "Microsoft.Component.MSBuild")
+
+        # Build the installer command
+        $installArgs = @(
+          "--quiet", # Minimal UI
+          "--wait",  # Wait for install to finish
+          "--norestart", # Don't restart
+          "--nocache", # Don't keep installer cache
+          "--installPath", "${{ runner.temp }}\vs_buildtools" # Install to temp for CI
+        ) + $componentArgs
+
+        Write-Output "Installing Visual Studio Build Tools with components: $($components -join ', ')"
+        Write-Output "Running command: $installerPath $($installArgs -join ' ')"
+        Start-Process -FilePath $installerPath -ArgumentList $installArgs -Wait -NoNewWindow
+
+        # Verification steps remain the same
+        Write-Output "Verifying installation..."
+        $msbuildPath = Get-Command "MSBuild.exe" -ErrorAction SilentlyContinue
+        if ($msbuildPath) {
+          Write-Output "MSBuild found at: $($msbuildPath.Path)"
+        } else {
+          Write-Error "MSBuild.exe not found. Build Tools installation may have failed."
+          exit 1
+        }
+
+        # Check for Windows SDK path (example for x64 tools)
+        $sdkPath = "C:\Program Files (x86)\Windows Kits\10\bin\${{ env.WINDOWS_SDK_VERSION }}\x64"
+        if (Test-Path $sdkPath) {
+          Write-Output "Windows SDK found at: $sdkPath"
+          # Add to PATH if not already there (GitHub Actions runners usually have it)
+          $env:PATH += ";$sdkPath"
+        } else {
+          Write-Warning "Windows SDK path $sdkPath not found. Check installation."
+          # This might not be critical if the SDK is integrated into the system/MSBuild correctly
+        }
+
+        # CMake is often included with Visual Studio; verify
+        $cmakePath = Get-Command "cmake.exe" -ErrorAction SilentlyContinue
+        if ($cmakePath) {
+          Write-Output "CMake found at: $($cmakePath.Path)"
+        } else {
+          Write-Output "CMake not found via command. Checking common VS install location..."
+          # The path might vary depending on the installation path used above or default VS path
+          # Default BuildTools path if installed to Program Files
+          $defaultVsCmakePath = "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+          if (Test-Path $defaultVsCmakePath) {
+             Write-Output "CMake found at default VS BuildTools path: $defaultVsCmakePath"
+             $env:PATH += ";$defaultVsCmakePath"
+          } else {
+             # Try the temp path if installed there
+             $tempVsCmakePath = "${{ runner.temp }}\vs_buildtools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+             if (Test-Path $tempVsCmakePath) {
+                Write-Output "CMake found at temp VS BuildTools path: $tempVsCmakePath"
+                $env:PATH += ";$tempVsCmakePath"
+             } else {
+                Write-Error "CMake not found in expected default or temp VS paths. Installation may be incomplete."
+                exit 1
+             }
+          }
+        }
+
+
+    - name: Setup Rust Environment (x64) # Important: Use the correct Dev Shell
+      if: matrix.target_arch == 'x86_64'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+          arch: x64 # Ensure the environment is set for x64 compilation
+
+    - name: Setup Rust Environment (ARM64) # Important: Use the correct Dev Shell
+      if: matrix.target_arch == 'aarch64'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+          arch: arm64 # Ensure the environment is set for ARM64 compilation
+
+    - name: Print Environment Info
+      shell: cmd
+      working-directory: zed # Ensure commands run inside the zed directory
+      run: |
+        echo "Build Type: ${{ inputs.build_type }}"
+        echo "Target Architecture: ${{ matrix.target_arch }}"
+        echo "Rust Target Triple: ${{ env.RUST_TARGET }}"
+        rustc --version
+        cargo --version
+        cmake --version
+        cl # Print compiler version
+
+    - name: Enable Git Long Paths
+      shell: powershell
+      working-directory: zed # Ensure git config is applied in the zed dir context if needed, though global is fine
+      run: |
+        git config --global core.longpaths true
+
+    - name: Configure Windows Long Paths (if needed)
+      shell: powershell
+      run: |
+        # Check current status
+        $currentStatus = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -ErrorAction SilentlyContinue
+        if ($currentStatus -and $currentStatus.LongPathsEnabled -eq 1) {
+          Write-Output "LongPathsEnabled is already set to 1."
+        } else {
+          Write-Output "Setting LongPathsEnabled to 1..."
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          Write-Output "LongPathsEnabled has been set. A restart might be needed, but for CI context, subsequent steps should work if paths are relative/short enough."
+        }
+
+    - name: Build Zed (${{ inputs.build_type }})
+      shell: cmd
+      working-directory: zed # Ensure the build command runs inside the zed directory
+      run: |
+        REM Determine the cargo command based on build type
+        if "${{ inputs.build_type }}" == "release" (
+          set CARGO_CMD=cargo build --target ${{ env.RUST_TARGET }} --release
+        ) else (
+          set CARGO_CMD=cargo build --target ${{ env.RUST_TARGET }}
+        )
+        echo Running: %CARGO_CMD%
+        %CARGO_CMD%
+
+    # Optional: Run tests (be aware this might take a long time)
+    # - name: Run Tests
+    #   shell: cmd
+    #   working-directory: zed # Ensure tests run inside the zed directory
+    #   run: |
+    #     cargo test --target ${{ env.RUST_TARGET }} --workspace --verbose
+
+    # Optional: Upload build artifacts (e.g., the compiled executable)
+    - name: Upload Build Artifacts
+      if: success() # Only upload if build succeeded
+      uses: actions/upload-artifact@v4
+      with:
+        name: zed-${{ inputs.build_type }}-${{ matrix.target_arch }}-${{ github.run_number }} # Unique name including run number
+        path: zed\target\${{ env.RUST_TARGET }}\${{ inputs.build_type }}\zed.exe # Path to the built executable, note the zed\ prefix
+        if-no-files-found: error # Fail the step if the executable is not found
+        retention-days: 5
